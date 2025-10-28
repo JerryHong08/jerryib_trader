@@ -1,0 +1,18 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace            # 删除每行末尾多余空格
+      - id: end-of-file-fixer              # 确保文件末尾有空行
+      - id: check-yaml                     # 检查 YAML 格式是否正确
+      - id: check-added-large-files        # 防止你不小心提交几百 MB 的文件
+
+  - repo: https://github.com/psf/black
+    rev: 25.9.0
+    hooks:
+      - id: black                          # 自动格式化 Python 代码
+
+  - repo: https://github.com/pre-commit/mirrors-isort
+    rev: v5.10.1
+    hooks:
+      - id: isort                          # 自动整理 import 顺序
