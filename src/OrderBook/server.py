@@ -222,28 +222,39 @@ async def debug_page():
 @app.websocket("/ws/quotes")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    consumer_tasks = {}  # 存储每个 symbol 的消费任务 {symbol: task}
+    current_symbols = set()
 
     try:
-        data = await websocket.receive_json()
-        print(f"debug:{data}")
-        symbols = data.get("symbols", [])
-        if isinstance(symbols, str):
-            symbols = [s.strip().upper() for s in symbols.split(",")]
-
-        await manager.subscribe(websocket, symbols)
-
-        # 每个 symbol 一个消费协程
-        consumer_tasks = [
-            asyncio.create_task(consume_symbol(websocket, sym)) for sym in symbols
-        ]
-
         while True:
             msg = await websocket.receive_text()
             if msg.startswith("unsubscribe:"):
                 symbol = msg.replace("unsubscribe:", "").strip().upper()
                 await manager.unsubscribe(websocket, symbol)
+
+                if symbol in current_symbols:
+                    consumer_tasks[symbol].cancel()
+                    del consumer_tasks[symbol]
+                current_symbols.discard(symbol)
+                print(f"Debug: Unsubscribed from {symbol}")
             else:
-                pass
+                try:
+                    data = json.loads(msg)
+                    symbols = data.get("symbols", [])
+                    if isinstance(symbols, str):
+                        symbols = [s.strip().upper() for s in symbols.split(",")]
+
+                    new_symbols = set(symbols) - current_symbols
+                    if new_symbols:
+                        await manager.subscribe(websocket, list(new_symbols))
+                        for sym in new_symbols:
+                            task = asyncio.create_task(consume_symbol(websocket, sym))
+                            consumer_tasks[sym] = task
+                        current_symbols.update(new_symbols)
+                        print(f"Debug: Subscribed to {new_symbols}")
+
+                except json.JSONDecodeError as e:
+                    print(f"⚠️ JSON decode error: {e}")
 
     except WebSocketDisconnect:
         await manager.disconnect(websocket)

@@ -39,6 +39,8 @@ class PolygonWebSocketManager:
         if not self.connected:
             await self.connect()
 
+        print(f"Debug: Subscribing to symbols: {symbols}")
+
         # 更新客户端的订阅列表
         if websocket_client not in self.connections:
             self.connections[websocket_client] = []
