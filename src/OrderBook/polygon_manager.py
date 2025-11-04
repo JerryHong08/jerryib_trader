@@ -17,9 +17,6 @@ class PolygonWebSocketManager:
         self.subscribed_symbols = set()  # 已订阅的 symbols
 
     async def connect(self):
-        # if self._is_ws_connected():
-        #     return
-
         try:
             url = "wss://socket.polygon.io/stocks"
             self.ws = await websockets.connect(url)
@@ -27,10 +24,6 @@ class PolygonWebSocketManager:
             # 发送认证
             await self.ws.send(json.dumps({"action": "auth", "params": self.api_key}))
 
-            # 等待认证响应
-            # auth_response = await self.ws.recv()
-            # auth_data = json.loads(auth_response)
-            # logger.info(f"Auth response: {auth_data}")
             print("✅ Authenticated to Polygon")
             self.connected = True
             logger.info("🔐 Polygon WebSocket connected & authenticated")
@@ -46,24 +39,34 @@ class PolygonWebSocketManager:
         if not self.connected:
             await self.connect()
 
-        self.connections[websocket_client] = symbols
+        # 更新客户端的订阅列表
+        if websocket_client not in self.connections:
+            self.connections[websocket_client] = []
+
+        # 合并新的 symbols 到客户端的订阅列表
+        existing_symbols = set(self.connections[websocket_client])
+        new_symbols = set(symbols)
+        self.connections[websocket_client] = list(existing_symbols | new_symbols)
 
         for sym in symbols:
             if sym not in self.queues:
                 self.queues[sym] = asyncio.Queue()
-            print(f"subsribed_symbols: debug:{self.subscribed_symbols}")
-            # 只订阅还未订阅的 symbols
+
+            # 只订阅还未在 Polygon 订阅的 symbols
             if sym not in self.subscribed_symbols:
                 try:
                     await self.ws.send(
                         json.dumps({"action": "subscribe", "params": f"Q.{sym}"})
                     )
                     self.subscribed_symbols.add(sym)
-                    logger.info(f"📡 Subscribed to: {sym}")
+                    logger.info(f"📡 Subscribed to Polygon: {sym}")
+                    print(f"📡 Successfully subscribed to {sym}")
                 except Exception as e:
                     logger.error(f"❌ Failed to subscribe to {sym}: {e}")
                     self.connected = False
                     self.ws = None
+            else:
+                print(f"ℹ️ {sym} already subscribed to Polygon")
 
     async def unsubscribe(self, websocket_client, symbol):
         """用户前端取消某个 symbol"""
@@ -74,22 +77,46 @@ class PolygonWebSocketManager:
         # 检查是否还有其他客户端订阅这个 symbol
         still_needed = any(symbol in syms for syms in self.connections.values())
 
-        if not still_needed and self.connected:
+        if not still_needed and self.connected and symbol in self.subscribed_symbols:
             try:
                 await self.ws.send(
                     json.dumps({"action": "unsubscribe", "params": f"Q.{symbol}"})
                 )
                 self.subscribed_symbols.discard(symbol)
                 self.queues.pop(symbol, None)
-                logger.info(f"❌ Unsubscribed from {symbol}")
+                logger.info(f"❌ Unsubscribed from Polygon: {symbol}")
+                print(f"❌ Unsubscribed from {symbol}")
             except Exception as e:
                 logger.error(f"❌ Failed to unsubscribe from {symbol}: {e}")
                 self.connected = False
                 self.ws = None
+        else:
+            print(f"ℹ️ {symbol} still needed by other clients")
 
     async def disconnect(self, websocket_client):
         """用户前端断开连接"""
-        self.connections.pop(websocket_client, None)
+        # 获取该客户端订阅的所有 symbols
+        client_symbols = self.connections.pop(websocket_client, [])
+
+        # 检查每个 symbol 是否还被其他客户端需要
+        for symbol in client_symbols:
+            still_needed = any(symbol in syms for syms in self.connections.values())
+
+            if (
+                not still_needed
+                and self.connected
+                and symbol in self.subscribed_symbols
+            ):
+                try:
+                    await self.ws.send(
+                        json.dumps({"action": "unsubscribe", "params": f"Q.{symbol}"})
+                    )
+                    self.subscribed_symbols.discard(symbol)
+                    self.queues.pop(symbol, None)
+                    logger.info(f"❌ Auto-unsubscribed from {symbol} (no more clients)")
+                except Exception as e:
+                    logger.error(f"❌ Failed to auto-unsubscribe from {symbol}: {e}")
+
         logger.info("🔌 Client disconnected")
 
     async def stream_forever(self):
@@ -118,7 +145,7 @@ class PolygonWebSocketManager:
                                 "ask_size": item["as"],
                                 "timestamp": item["t"],
                             }
-                            print(f"debug:{payload}")
+                            # print(f"📊 Quote: {payload}")
                             q = self.queues.get(symbol)
                             if q:
                                 await q.put(payload)
