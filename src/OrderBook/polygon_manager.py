@@ -122,7 +122,7 @@ class PolygonWebSocketManager:
         logger.info("🔌 Client disconnected")
 
     async def stream_forever(self):
-        """持续监听 Polygon WebSocket 数据"""
+        """Polygon WebSocket Forever"""
         while True:
             try:
                 await self.connect()
@@ -137,7 +137,7 @@ class PolygonWebSocketManager:
                         continue
 
                     for item in data:
-                        if item.get("ev") == "Q":  # Quote事件
+                        if item.get("ev") == "Q":
                             symbol = item["sym"]
                             payload = {
                                 "symbol": symbol,
@@ -147,7 +147,7 @@ class PolygonWebSocketManager:
                                 "ask_size": item["as"],
                                 "timestamp": item["t"],
                             }
-                            # print(f"📊 Quote: {payload}")
+                            # print(f"Quote: {payload}")
                             q = self.queues.get(symbol)
                             if q:
                                 await q.put(payload)
@@ -159,7 +159,7 @@ class PolygonWebSocketManager:
                 self.connected = False
                 self.ws = None
                 self.subscribed_symbols.clear()
-                await asyncio.sleep(5)  # 等待 5 秒后重连
+                await asyncio.sleep(5)
 
             except Exception as e:
                 logger.error(f"❌ Error in stream_forever: {e}")

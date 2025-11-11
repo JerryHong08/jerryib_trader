@@ -17,7 +17,7 @@ export default function OrderBookDashboard() {
 
   const [input, setInput] = useState("");
   const ws = useRef<WebSocket | null>(null);
-  // 改为存储所有 symbols 的 quotes
+  // 存储所有 symbols 的 quotes
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
 
   useEffect(() => {
@@ -128,7 +128,8 @@ export default function OrderBookDashboard() {
                   <div className="flex justify-between">
                     <span className="text-sm text-gray-600">Updated:</span>
                     <span className="text-xs text-gray-500">
-                      {new Date(quote.timestamp / 1e6).toLocaleTimeString()}
+                      {/* {new Date(quote.timestamp / 1e9).toLocaleTimeString()} */}
+                      {new Date(quote.timestamp).toLocaleTimeString()}
                     </span>
                   </div>
                 </div>
