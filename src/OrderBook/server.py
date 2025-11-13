@@ -21,8 +21,7 @@ async def startup_event():
 # debug
 @app.get("/debug/status")
 async def debug_status():
-    """查看连接状态"""
-    # 计算所有客户端订阅的 symbols
+    """check for all conneccted clients status"""
     all_client_symbols = {}
     for client, symbols in manager.connections.items():
         client_id = (
@@ -43,7 +42,7 @@ async def debug_status():
 
 @app.get("/debug/latest/{symbol}")
 async def get_latest_quote(symbol: str):
-    """获取某个股票的最新报价"""
+    """get symbol latest quote data"""
     symbol = symbol.upper()
     queue = manager.queues.get(symbol)
 
@@ -53,7 +52,7 @@ async def get_latest_quote(symbol: str):
     if queue.empty():
         return {"message": f"No data available for {symbol}"}
 
-    # 获取队列中最新的数据（非阻塞）
+    # get the lastest quote data
     try:
         latest_data = None
         while not queue.empty():
@@ -67,7 +66,7 @@ async def get_latest_quote(symbol: str):
 @app.get("/debug/subscribe/{symbol}")
 @app.post("/debug/subscribe/{symbol}")
 async def debug_subscribe(symbol: str):
-    """手动订阅某个股票"""
+    """subscribe a symbol"""
     symbol = symbol.upper()
     await manager.subscribe("debug_client", [symbol])
     return {"message": f"Subscribed to {symbol}"}
@@ -76,7 +75,7 @@ async def debug_subscribe(symbol: str):
 @app.get("/debug/unsubscribe/{symbol}")
 @app.post("/debug/unsubscribe/{symbol}")
 async def debug_unsubscribe(symbol: str):
-    """手动取消订阅某个股票"""
+    """unsubscribe a symbol"""
     symbol = symbol.upper()
     await manager.unsubscribe("debug_client", symbol)
     return {"message": f"Unsubscribed to {symbol}"}
@@ -84,7 +83,7 @@ async def debug_unsubscribe(symbol: str):
 
 @app.get("/debug", response_class=HTMLResponse)
 async def debug_page():
-    """调试页面"""
+    """Debug Page"""
     return """
     <!DOCTYPE html>
     <html>
@@ -209,7 +208,7 @@ async def debug_page():
                 document.getElementById('output').innerHTML = '';
             }
 
-            // 自动检查状态
+            // auto check status
             // checkStatus();
             // setInterval(checkStatus, 5000);
         </script>
@@ -222,7 +221,7 @@ async def debug_page():
 @app.websocket("/ws/quotes")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    consumer_tasks = {}  # 存储每个 symbol 的消费任务 {symbol: task}
+    consumer_tasks = {}  # store each symbol consume task {symbol: task}
     current_symbols = set()
 
     try:
@@ -263,7 +262,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 async def consume_symbol(websocket: WebSocket, symbol: str):
-    """持续消费单个 symbol 的队列并推送给前端"""
+    """comsume symbol queue and push it to frontend"""
     q = manager.queues.get(symbol)
     while True:
         data = await q.get()

@@ -12,16 +12,16 @@ class PolygonWebSocketManager:
         self.api_key = api_key
         self.ws = None
         self.connected = False
-        self.queues = {}  # 每个 symbol 一个队列
+        self.queues = {}  # dict for storing each symbol quuote data
         self.connections = {}  # { websocket_client: [symbols] }
-        self.subscribed_symbols = set()  # 已订阅的 symbols
+        self.subscribed_symbols = set()
 
     async def connect(self):
         try:
             url = "wss://socket.polygon.io/stocks"
             self.ws = await websockets.connect(url)
 
-            # 发送认证
+            # send authentication request
             await self.ws.send(json.dumps({"action": "auth", "params": self.api_key}))
 
             print("✅ Authenticated to Polygon")
@@ -35,17 +35,17 @@ class PolygonWebSocketManager:
             raise
 
     async def subscribe(self, websocket_client, symbols):
-        """用户前端订阅行情"""
+        """subscribe new symbols"""
         if not self.connected:
             await self.connect()
 
         print(f"Debug: Subscribing to symbols: {symbols}")
 
-        # 更新客户端的订阅列表
+        # update client symbol list
         if websocket_client not in self.connections:
             self.connections[websocket_client] = []
 
-        # 合并新的 symbols 到客户端的订阅列表
+        # merge new symbols to client list
         existing_symbols = set(self.connections[websocket_client])
         new_symbols = set(symbols)
         self.connections[websocket_client] = list(existing_symbols | new_symbols)
@@ -54,7 +54,7 @@ class PolygonWebSocketManager:
             if sym not in self.queues:
                 self.queues[sym] = asyncio.Queue()
 
-            # 只订阅还未在 Polygon 订阅的 symbols
+            # incrementally subscribe
             if sym not in self.subscribed_symbols:
                 try:
                     await self.ws.send(
@@ -71,12 +71,12 @@ class PolygonWebSocketManager:
                 print(f"ℹ️ {sym} already subscribed to Polygon")
 
     async def unsubscribe(self, websocket_client, symbol):
-        """用户前端取消某个 symbol"""
+        """unsubscribe symbol"""
         if websocket_client in self.connections:
             if symbol in self.connections[websocket_client]:
                 self.connections[websocket_client].remove(symbol)
 
-        # 检查是否还有其他客户端订阅这个 symbol
+        # check if there is other client subscribing this symbol
         still_needed = any(symbol in syms for syms in self.connections.values())
 
         if not still_needed and self.connected and symbol in self.subscribed_symbols:
@@ -96,11 +96,9 @@ class PolygonWebSocketManager:
             print(f"ℹ️ {symbol} still needed by other clients")
 
     async def disconnect(self, websocket_client):
-        """用户前端断开连接"""
-        # 获取该客户端订阅的所有 symbols
+        """client disconnect"""
         client_symbols = self.connections.pop(websocket_client, [])
 
-        # 检查每个 symbol 是否还被其他客户端需要
         for symbol in client_symbols:
             still_needed = any(symbol in syms for syms in self.connections.values())
 

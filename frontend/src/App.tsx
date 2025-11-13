@@ -17,7 +17,6 @@ export default function OrderBookDashboard() {
 
   const [input, setInput] = useState("");
   const ws = useRef<WebSocket | null>(null);
-  // 存储所有 symbols 的 quotes
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
 
   useEffect(() => {
@@ -32,7 +31,7 @@ export default function OrderBookDashboard() {
       console.log("📩 Message from server:", event.data);
       const data: Quote = JSON.parse(event.data);
 
-      // 更新对应 symbol 的 quote
+      // update its symbol quote
       setQuotes(prev => ({
         ...prev,
         [data.symbol]: data
@@ -58,7 +57,7 @@ export default function OrderBookDashboard() {
     localStorage.setItem("symbols", JSON.stringify(updated));
     ws.current?.send(`unsubscribe:${symbol}`);
 
-    // 清除对应的 quote 数据
+    // clear its quote data
     setQuotes(prev => {
       const newQuotes = { ...prev };
       delete newQuotes[symbol];

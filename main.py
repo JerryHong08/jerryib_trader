@@ -16,7 +16,7 @@ client = WebSocketClient(
 )
 
 # quotes
-client.subscribe("Q.QLGN")
+client.subscribe("Q.AAPL")
 
 
 def handle_msg(msgs: List[WebSocketMessage]):
