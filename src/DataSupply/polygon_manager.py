@@ -15,9 +15,12 @@ class PolygonWebSocketManager:
         self.api_key = api_key
         self.ws = None
         self.connected = False
-        self.queues = {}  # dict for storing each symbol quotes/trades... data
-        self.connections = {}  # { websocket_client: [symbols] }
-        self.subscribed_symbols = set()
+        # queues keyed by stream_key, e.g. "Q.AAPL" or "T.AAPL"
+        self.queues = {}  # { stream_key: asyncio.Queue }
+        # connections map client -> set of stream_keys
+        self.connections = {}  # { websocket_client: set(stream_keys) }
+        # track which stream_keys have been subscribed to Polygon
+        self.subscribed_streams = set()
 
     async def connect(self):
         try:
@@ -47,29 +50,28 @@ class PolygonWebSocketManager:
 
         print(f"Debug: Subscribing to symbols: {symbols}")
 
-        # update client symbol list
+        # ensure client mapping exists
         if websocket_client not in self.connections:
-            self.connections[websocket_client] = []
-
-        # merge new symbols to client list
-        existing_symbols = set(self.connections[websocket_client])
-        new_symbols = set(symbols)
-        self.connections[websocket_client] = list(existing_symbols | new_symbols)
+            self.connections[websocket_client] = set()
 
         for sym in symbols:
-            if sym not in self.queues:
-                self.queues[sym] = asyncio.Queue()
-
             for ev in events:
                 stream_key = f"{ev}.{sym}"
 
-                # incrementally subscribe
-                if stream_key not in self.subscribed_symbols:
+                # ensure a queue exists for this stream_key
+                if stream_key not in self.queues:
+                    self.queues[stream_key] = asyncio.Queue()
+
+                # add to client's subscriptions
+                self.connections[websocket_client].add(stream_key)
+
+                # incrementally subscribe to Polygon only once per stream_key
+                if stream_key not in self.subscribed_streams:
                     try:
                         await self.ws.send(
                             json.dumps({"action": "subscribe", "params": stream_key})
                         )
-                        self.subscribed_symbols.add(stream_key)
+                        self.subscribed_streams.add(stream_key)
                         logger.info(f"📡 Subscribed to Polygon: {stream_key}")
                         print(f"📡 Successfully subscribed to {stream_key}")
                     except Exception as e:
@@ -77,63 +79,67 @@ class PolygonWebSocketManager:
                         self.connected = False
                         self.ws = None
                 else:
-                    print(f"ℹ️ {sym} already subscribed to Polygon")
+                    # already subscribed globally
+                    print(f"ℹ️ {stream_key} already subscribed to Polygon")
 
     async def unsubscribe(self, websocket_client, symbol, events=["Q"]):
         """
         unsubscribe symbol
         """
-
+        # remove stream_keys for this symbol from this client
         if websocket_client in self.connections:
-            if symbol in self.connections[websocket_client]:
-                self.connections[websocket_client].remove(symbol)
-
-        # check if there is other client subscribing this symbol
-        still_needed = any(symbol in syms for syms in self.connections.values())
-
-        if not still_needed and self.connected:
             for ev in events:
-                stream_key = f"{ev}.{symbol}"
-                if stream_key in self.subscribed_symbols:
+                sk = f"{ev}.{symbol}"
+                self.connections[websocket_client].discard(sk)
+
+        # for each stream_key, if no other client needs it, unsubscribe from Polygon and remove queue
+        for ev in events:
+            stream_key = f"{ev}.{symbol}"
+            still_needed = any(stream_key in syms for syms in self.connections.values())
+
+            if not still_needed and self.connected:
+                if stream_key in self.subscribed_streams:
                     try:
                         await self.ws.send(
-                            json.dumps(
-                                {"action": "unsubscribe", "params": f"Q.{symbol}"}
-                            )
+                            json.dumps({"action": "unsubscribe", "params": stream_key})
                         )
-                        self.subscribed_symbols.discard(stream_key)
+                        self.subscribed_streams.discard(stream_key)
                         logger.info(f"❌ Unsubscribed from Polygon: {stream_key}")
                         print(f"❌ Unsubscribed for {stream_key}")
                     except Exception as e:
-                        logger.error(f"❌ Failed to unsubscribe from {symbol}: {e}")
+                        logger.error(f"❌ Failed to unsubscribe from {stream_key}: {e}")
                         self.connected = False
                         self.ws = None
-            self.queues.pop(symbol, None)
-        else:
-            print(f"ℹ️ {symbol} still needed by other clients")
+                # remove queue
+                self.queues.pop(stream_key, None)
+            else:
+                print(f"ℹ️ {stream_key} still needed by other clients or not connected")
 
     async def disconnect(self, websocket_client):
         """client disconnect"""
-        client_symbols = self.connections.pop(websocket_client, [])
+        client_streams = self.connections.pop(websocket_client, set())
 
-        for symbol in client_symbols:
-            still_needed = any(symbol in syms for syms in self.connections.values())
+        for stream_key in list(client_streams):
+            still_needed = any(stream_key in syms for syms in self.connections.values())
 
             if (
                 not still_needed
                 and self.connected
-                # and stream_key in self.subscribed_symbols
-                and symbol in self.subscribed_symbols
+                and stream_key in self.subscribed_streams
             ):
                 try:
                     await self.ws.send(
-                        json.dumps({"action": "unsubscribe", "params": f"Q.{symbol}"})
+                        json.dumps({"action": "unsubscribe", "params": stream_key})
                     )
-                    self.subscribed_symbols.discard(symbol)
-                    self.queues.pop(symbol, None)
-                    logger.info(f"❌ Auto-unsubscribed from {symbol} (no more clients)")
+                    self.subscribed_streams.discard(stream_key)
+                    self.queues.pop(stream_key, None)
+                    logger.info(
+                        f"❌ Auto-unsubscribed from {stream_key} (no more clients)"
+                    )
                 except Exception as e:
-                    logger.error(f"❌ Failed to auto-unsubscribe from {symbol}: {e}")
+                    logger.error(
+                        f"❌ Failed to auto-unsubscribe from {stream_key}: {e}"
+                    )
 
         logger.info("🔌 Client disconnected")
 
@@ -153,31 +159,39 @@ class PolygonWebSocketManager:
                         continue
 
                     for item in data:
-                        if item.get("ev") == "Q":
+                        ev = item.get("ev")
+                        if ev == "Q":
                             symbol = item["sym"]
                             payload = {
                                 "event_type": "Q",
                                 "symbol": symbol,
-                                "bid": item["bp"],
-                                "ask": item["ap"],
-                                "bid_size": item["bs"],
-                                "ask_size": item["as"],
-                                "timestamp": item["t"],
+                                "bid": item.get("bp"),
+                                "ask": item.get("ap"),
+                                "bid_size": item.get("bs"),
+                                "ask_size": item.get("as"),
+                                "timestamp": item.get("t"),
                             }
-                            # print(f"Quote: {payload}")
-                            q = self.queues.get(symbol)
+                            stream_key = f"Q.{symbol}"
+                            q = self.queues.get(stream_key)
                             if q:
                                 await q.put(payload)
 
-                        # elif item.get("ev") == "T":  # Trade
-                        #     symbol = item["sym"]
-                        #     payload = {
-                        #         "event_type": "T",
-                        #         "symbol": symbol,
-                        #         "price": item["p"],
-                        #         "size": item["s"],
-                        #         "timestamp": item["t"],
-                        #     }
+                        elif ev == "T":  # Trade
+                            symbol = item["sym"]
+                            payload = {
+                                "event_type": "T",
+                                "symbol": symbol,
+                                "price": item.get("p"),
+                                "size": item.get("s"),
+                                "tape": item.get("z"),
+                                "sequence_number": item.get("i"),
+                                "timestamp": item.get("t"),
+                                "trtf": item.get("trf_ts"),
+                            }
+                            stream_key = f"T.{symbol}"
+                            q = self.queues.get(stream_key)
+                            if q:
+                                await q.put(payload)
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning(
@@ -185,12 +199,12 @@ class PolygonWebSocketManager:
                 )
                 self.connected = False
                 self.ws = None
-                self.subscribed_symbols.clear()
+                self.subscribed_streams.clear()
                 await asyncio.sleep(5)
 
             except Exception as e:
                 logger.error(f"❌ Error in stream_forever: {e}")
                 self.connected = False
                 self.ws = None
-                self.subscribed_symbols.clear()
+                self.subscribed_streams.clear()
                 await asyncio.sleep(5)

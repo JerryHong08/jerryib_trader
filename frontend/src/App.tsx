@@ -13,11 +13,7 @@ interface Trade {
   symbol: string;
   price: number;
   size: number;
-  id: string;
-  tape: number; // (1 = NYSE, 2 = AMEX, 3 = Nasdaq).
-  sequence_number: number;
   timestamp: number;
-  trtf: number; // The TRF (Trade Reporting Facility) Timestamp in Unix MS
 }
 
 export default function OrderBookDashboard() {
@@ -29,25 +25,43 @@ export default function OrderBookDashboard() {
 
   const [input, setInput] = useState("");
   const ws = useRef<WebSocket | null>(null);
-  const [quotes, setQuotes] = useState<Record<string, Quote>>({});
+  // data per symbol, grouping events by event_type: { [symbol]: { Q?: Quote, T?: Trade } }
+  const [symbolData, setSymbolData] = useState<Record<string, Partial<Record<'Q' | 'T', Quote | Trade>>>>({});
+  // per-symbol events that were subscribed (persisted)
+  const [perSymbolEvents, setPerSymbolEvents] = useState<Record<string, string[]>>(() => {
+    const saved = localStorage.getItem("perSymbolEvents");
+    return saved ? JSON.parse(saved) : {};
+  });
+  // selected events for new subscriptions (Q = quotes, T = trades)
+  const [selectedEvents, setSelectedEvents] = useState<string[]>(["Q","T"]);
 
   useEffect(() => {
     ws.current = new WebSocket("ws://localhost:8000/ws/tickdata");
 
     ws.current.onopen = () => {
       console.log("✅ Connected to backend");
-      ws.current?.send(JSON.stringify({ symbols }));
+      // on connect, re-subscribe stored symbols with their events
+      if (symbols.length > 0) {
+        // build subscriptions array
+        const subs = symbols.map((s) => ({ symbol: s, events: perSymbolEvents[s] || ["Q"] }));
+        ws.current?.send(JSON.stringify({ subscriptions: subs }));
+      }
     };
 
     ws.current.onmessage = (event) => {
-      console.log("📩 Message from server:", event.data);
-      const data: Quote = JSON.parse(event.data);
+      // messages include an event_type field now
+      // console.log("📩 Message from server:", event.data);
+      const data = JSON.parse(event.data);
+      const ev = data.event_type;
+      const sym = data.symbol;
 
-      // update its symbol quote
-      setQuotes(prev => ({
-        ...prev,
-        [data.symbol]: data
-      }));
+      setSymbolData((prev) => {
+        const prevSym = prev[sym] || {};
+        return {
+          ...prev,
+          [sym]: { ...prevSym, [ev]: data },
+        };
+      });
     };
 
     ws.current.onclose = () => console.log("❌ Disconnected");
@@ -56,10 +70,21 @@ export default function OrderBookDashboard() {
   }, []);
 
   const addSymbol = () => {
-    const newSymbols = [...new Set([...symbols, ...input.split(",").map(s => s.trim().toUpperCase())])];
+    const newSyms = input.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+    const newSymbols = Array.from(new Set([...symbols, ...newSyms]));
     setSymbols(newSymbols);
+    // save per-symbol events for each newly added symbol
+    const newPerSymbolEvents = { ...perSymbolEvents };
+    newSyms.forEach((s) => {
+      newPerSymbolEvents[s] = selectedEvents;
+    });
+    setPerSymbolEvents(newPerSymbolEvents);
     localStorage.setItem("symbols", JSON.stringify(newSymbols));
-    ws.current?.send(JSON.stringify({ symbols: newSymbols }));
+    localStorage.setItem("perSymbolEvents", JSON.stringify(newPerSymbolEvents));
+
+    // send subscriptions to server in the shape: { subscriptions: [{symbol, events}, ...] }
+    const subs = newSyms.map((s) => ({ symbol: s, events: selectedEvents }));
+    if (subs.length > 0) ws.current?.send(JSON.stringify({ subscriptions: subs }));
     setInput("");
   };
 
@@ -67,13 +92,22 @@ export default function OrderBookDashboard() {
     const updated = symbols.filter(s => s !== symbol);
     setSymbols(updated);
     localStorage.setItem("symbols", JSON.stringify(updated));
-    ws.current?.send(`unsubscribe:${symbol}`);
+    // send unsubscribe with events for this symbol if we have them
+    const events = perSymbolEvents[symbol] || ["Q"];
+    ws.current?.send(JSON.stringify({ action: "unsubscribe", symbol, events }));
+    console.log("unsubscribe:", symbol)
 
-    // clear its quote data
-    setQuotes(prev => {
-      const newQuotes = { ...prev };
-      delete newQuotes[symbol];
-      return newQuotes;
+    // remove saved per-symbol events
+    const newPer = { ...perSymbolEvents };
+    delete newPer[symbol];
+    setPerSymbolEvents(newPer);
+    localStorage.setItem("perSymbolEvents", JSON.stringify(newPer));
+
+    // clear its data
+    setSymbolData(prev => {
+      const newData = { ...prev };
+      delete newData[symbol];
+      return newData;
     });
   };
 
@@ -97,7 +131,9 @@ export default function OrderBookDashboard() {
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {symbols.map((symbol) => {
-          const quote = quotes[symbol];
+          const data = symbolData[symbol] || {};
+          const quote = data["Q"];
+          const trade = data["T"];
           return (
             <div key={symbol} className="border p-4 rounded-lg shadow-sm bg-gray-50">
               <div className="flex justify-between items-start mb-3">
@@ -111,45 +147,45 @@ export default function OrderBookDashboard() {
                 </button>
               </div>
 
-              {quote ? (
-                <div className="space-y-2">
-                  <div className="flex justify-between">
-                    <span className="text-sm text-gray-600">Bid:</span>
-                    <span className="font-mono">
-                      <span className="text-green-600 font-semibold">${quote.bid}</span>
-                      <span className="text-gray-500 ml-1">x {quote.bid_size}</span>
-                    </span>
+              <div className="space-y-3">
+                {/* Quote panel */}
+                <div className="bg-white p-3 rounded border">
+                  <div className="flex justify-between mb-1">
+                    <span className="text-sm text-gray-600">Bid</span>
+                    <span className="font-mono text-green-600 font-semibold">{quote ? `$${(quote as Quote).bid}` : '—'}</span>
                   </div>
 
-                  <div className="flex justify-between">
-                    <span className="text-sm text-gray-600">Ask:</span>
-                    <span className="font-mono">
-                      <span className="text-red-600 font-semibold">${quote.ask}</span>
-                      <span className="text-gray-500 ml-1">x {quote.ask_size}</span>
-                    </span>
+                  <div className="flex justify-between mb-1">
+                    <span className="text-sm text-gray-600">Ask</span>
+                    <span className="font-mono text-red-600 font-semibold">{quote ? `$${(quote as Quote).ask}` : '—'}</span>
                   </div>
 
-                  <div className="flex justify-between">
-                    <span className="text-sm text-gray-600">Spread:</span>
-                    <span className="font-mono text-gray-700">
-                      ${(quote.ask - quote.bid).toFixed(2)}
-                    </span>
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>Sizes</span>
+                    <span>{quote ? `B:${(quote as Quote).bid_size} / A:${(quote as Quote).ask_size}` : '—'}</span>
                   </div>
-
-                  <div className="flex justify-between">
-                    <span className="text-sm text-gray-600">Updated:</span>
-                    <span className="text-xs text-gray-500">
-                      {/* {new Date(quote.timestamp / 1e9).toLocaleTimeString()} */}
-                      {new Date(quote.timestamp).toLocaleTimeString()}
-                    </span>
+                  <div className="flex justify-between text-xs text-gray-400 mt-1">
+                    <span>Updated</span>
+                    <span>{quote ? new Date(quote.timestamp).toLocaleTimeString() : '—'}</span>
                   </div>
                 </div>
-              ) : (
-                <div className="flex items-center justify-center py-8">
-                  <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-500"></div>
-                  <span className="ml-2 text-gray-500">Waiting for data...</span>
+
+                {/* Trade panel */}
+                <div className="bg-white p-3 rounded border">
+                  <div className="flex justify-between mb-1">
+                    <span className="text-sm text-gray-600">Last Trade</span>
+                    <span className="font-mono text-gray-800 font-semibold">{trade ? `$${(trade as Trade).price}` : '—'}</span>
+                  </div>
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>Size</span>
+                    <span>{trade ? (trade as Trade).size : '—'}</span>
+                  </div>
+                  <div className="flex justify-between text-xs text-gray-400 mt-1">
+                    <span>Time</span>
+                    <span>{trade ? new Date(trade.timestamp).toLocaleTimeString() : '—'}</span>
+                  </div>
                 </div>
-              )}
+              </div>
             </div>
           );
         })}
@@ -161,6 +197,33 @@ export default function OrderBookDashboard() {
           <p>Add some stock symbols to start monitoring quotes</p>
         </div>
       )}
+
+      {/* Event selection UI: global selection for new subscriptions */}
+      <div className="mt-4 flex items-center gap-4">
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={selectedEvents.includes('Q')}
+            onChange={(e) => {
+              if (e.target.checked) setSelectedEvents((s) => Array.from(new Set([...s, 'Q'])));
+              else setSelectedEvents((s) => s.filter(x => x !== 'Q'));
+            }}
+          />
+          Quotes (Q)
+        </label>
+
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={selectedEvents.includes('T')}
+            onChange={(e) => {
+              if (e.target.checked) setSelectedEvents((s) => Array.from(new Set([...s, 'T'])));
+              else setSelectedEvents((s) => s.filter(x => x !== 'T'));
+            }}
+          />
+          Trades (T)
+        </label>
+      </div>
     </div>
   );
 }

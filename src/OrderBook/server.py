@@ -14,6 +14,7 @@ logger = setup_logger(__name__, log_to_file=True)
 
 load_dotenv()
 app = FastAPI()
+
 manager = PolygonWebSocketManager(api_key=os.getenv("POLYGON_API_KEY"))
 # manager = LocalReplayWebSocketManager("20251112")
 
@@ -28,36 +29,37 @@ async def startup_event():
 async def debug_status():
     """check for all conneccted clients status"""
     all_client_symbols = {}
-    for client, symbols in manager.connections.items():
+    for client, stream_keys in manager.connections.items():
         client_id = (
             f"client_{id(client)}" if hasattr(client, "__hash__") else str(client)
         )
-        all_client_symbols[client_id] = symbols
+        all_client_symbols[client_id] = list(stream_keys)
 
     return {
         "connected": manager.connected,
-        "subscribed_symbols": list(manager.subscribed_symbols),
+        "subscribed_streams": list(manager.subscribed_streams),
         "active_connections": len(manager.connections),
         "client_subscriptions": all_client_symbols,
         "queue_lengths": {
-            symbol: queue.qsize() for symbol, queue in manager.queues.items()
+            stream: queue.qsize() for stream, queue in manager.queues.items()
         },
     }
 
 
 @app.get("/debug/latest/{symbol}")
-async def get_latest_quote(symbol: str):
-    """get symbol latest quote data"""
+async def get_latest_quote(symbol: str, event: str = "Q"):
+    """get symbol latest event data (default Q=quote). Use ?event=T for trades."""
     symbol = symbol.upper()
-    queue = manager.queues.get(symbol)
+    stream_key = f"{event}.{symbol}"
+    queue = manager.queues.get(stream_key)
 
     if not queue:
-        return {"error": f"Symbol {symbol} not subscribed"}
+        return {"error": f"Stream {stream_key} not subscribed"}
 
     if queue.empty():
-        return {"message": f"No data available for {symbol}"}
+        return {"message": f"No data available for {stream_key}"}
 
-    # get the lastest quote data
+    # get the latest event data
     try:
         latest_data = None
         while not queue.empty():
@@ -70,20 +72,22 @@ async def get_latest_quote(symbol: str):
 
 @app.get("/debug/subscribe/{symbol}")
 @app.post("/debug/subscribe/{symbol}")
-async def debug_subscribe(symbol: str):
-    """subscribe a symbol"""
+async def debug_subscribe(symbol: str, events: str = "Q"):
+    """subscribe a symbol. Pass events comma-separated via ?events=Q,T"""
     symbol = symbol.upper()
-    await manager.subscribe("debug_client", [symbol])
-    return {"message": f"Subscribed to {symbol}"}
+    evs = [e.strip().upper() for e in events.split(",") if e.strip()]
+    await manager.subscribe("debug_client", [symbol], events=evs)
+    return {"message": f"Subscribed to {symbol} events={evs}"}
 
 
 @app.get("/debug/unsubscribe/{symbol}")
 @app.post("/debug/unsubscribe/{symbol}")
-async def debug_unsubscribe(symbol: str):
-    """unsubscribe a symbol"""
+async def debug_unsubscribe(symbol: str, events: str = "Q"):
+    """unsubscribe a symbol. Pass events comma-separated via ?events=Q,T"""
     symbol = symbol.upper()
-    await manager.unsubscribe("debug_client", symbol)
-    return {"message": f"Unsubscribed to {symbol}"}
+    evs = [e.strip().upper() for e in events.split(",") if e.strip()]
+    await manager.unsubscribe("debug_client", symbol, events=evs)
+    return {"message": f"Unsubscribed {symbol} events={evs}"}
 
 
 @app.get("/debug", response_class=HTMLResponse)
@@ -227,33 +231,96 @@ async def debug_page():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     consumer_tasks = {}  # store each symbol consume task {symbol: task}
-    current_symbols = set()
+    # now track stream_keys (e.g. Q.AAPL, T.AAPL)
+    consumer_tasks = {}
+    current_streams = set()
 
     try:
         while True:
             msg = await websocket.receive_text()
-            if msg.startswith("unsubscribe:"):
-                symbol = msg.replace("unsubscribe:", "").strip().upper()
-                await manager.unsubscribe(websocket, symbol)
 
-                if symbol in current_symbols:
-                    consumer_tasks[symbol].cancel()
-                    del consumer_tasks[symbol]
-                current_symbols.discard(symbol)
+            # support legacy string unsubscribe:unsubscribe:SYMBOL or unsubscribe:Q.SYMBOL
+            if isinstance(msg, str) and msg.startswith("unsubscribe:"):
+                val = msg.replace("unsubscribe:", "").strip().upper()
+                # if stream_key format provided (ev.SYMBOL)
+                if "." in val:
+                    stream_key = val
+                    logger.debug(f"unsubscribe: {stream_key}")
+                    ev, sym = stream_key.split(".", 1)
+                    await manager.unsubscribe(websocket, sym, events=[ev])
+                    if stream_key in current_streams:
+                        consumer_tasks[stream_key].cancel()
+                        del consumer_tasks[stream_key]
+                    current_streams.discard(stream_key)
+                else:
+                    # unsubscribe all events for this symbol
+                    # best-effort: try Q and T
+                    await manager.unsubscribe(websocket, val, events=["Q", "T"])
+                    # cancel any tasks matching that symbol
+                    for sk in list(current_streams):
+                        if sk.endswith(f".{val}"):
+                            consumer_tasks[sk].cancel()
+                            del consumer_tasks[sk]
+                            current_streams.discard(sk)
+
             else:
                 try:
                     data = json.loads(msg)
-                    symbols = data.get("symbols", [])
-                    if isinstance(symbols, str):
-                        symbols = [s.strip().upper() for s in symbols.split(",")]
 
-                    new_symbols = set(symbols) - current_symbols
-                    if new_symbols:
-                        await manager.subscribe(websocket, list(new_symbols))
-                        for sym in new_symbols:
-                            task = asyncio.create_task(consume_symbol(websocket, sym))
-                            consumer_tasks[sym] = task
-                        current_symbols.update(new_symbols)
+                    # handle unsubscribe action from JSON message
+                    if data.get("action") == "unsubscribe":
+                        sym = data.get("symbol", "").strip().upper()
+                        evs = data.get("events", ["Q"])
+                        evs = [e.strip().upper() for e in evs]
+
+                        logger.info(f"📤 Unsubscribe request: {sym} events={evs}")
+                        await manager.unsubscribe(websocket, sym, events=evs)
+
+                        # cancel consumer tasks for these stream_keys
+                        for ev in evs:
+                            stream_key = f"{ev}.{sym}"
+                            if stream_key in current_streams:
+                                consumer_tasks[stream_key].cancel()
+                                del consumer_tasks[stream_key]
+                                current_streams.discard(stream_key)
+                        continue
+
+                    # new message shape: either
+                    # { "subscriptions": [{"symbol":"AAPL","events":["Q","T"]}, ...] }
+                    # or { "symbols": ["AAPL","MSFT"], "events": ["Q","T"] }
+
+                    new_streams = set()
+
+                    if "subscriptions" in data:
+                        for entry in data["subscriptions"]:
+                            sym = entry.get("symbol", "").strip().upper()
+                            evs = entry.get("events", ["Q"])
+                            evs = [e.strip().upper() for e in evs]
+                            # subscribe per symbol+events
+                            await manager.subscribe(websocket, [sym], events=evs)
+                            for ev in evs:
+                                new_streams.add(f"{ev}.{sym}")
+
+                    else:
+                        symbols = data.get("symbols", [])
+                        events = data.get("events", ["Q"])
+                        if isinstance(symbols, str):
+                            symbols = [s.strip().upper() for s in symbols.split(",")]
+                        symbols = [s.strip().upper() for s in symbols]
+                        events = [e.strip().upper() for e in events]
+
+                        if symbols:
+                            await manager.subscribe(websocket, symbols, events=events)
+                            for sym in symbols:
+                                for ev in events:
+                                    new_streams.add(f"{ev}.{sym}")
+
+                    # create consumer tasks for new_streams not already present
+                    to_add = new_streams - current_streams
+                    for sk in to_add:
+                        task = asyncio.create_task(consume_stream(websocket, sk))
+                        consumer_tasks[sk] = task
+                    current_streams.update(to_add)
 
                 except json.JSONDecodeError as e:
                     print(f"⚠️ JSON decode error: {e}")
@@ -264,10 +331,12 @@ async def websocket_endpoint(websocket: WebSocket):
             task.cancel()
 
 
-async def consume_symbol(websocket: WebSocket, symbol: str):
-    """comsume symbol queue and push it to frontend"""
-    q = manager.queues.get(symbol)
+async def consume_stream(websocket: WebSocket, stream_key: str):
+    """consume a specific stream_key queue and push to frontend"""
+    q = manager.queues.get(stream_key)
+    if q is None:
+        # nothing to consume
+        return
     while True:
         data = await q.get()
-        # print(data)
         await websocket.send_json(data)
