@@ -9,7 +9,19 @@ interface Quote {
   timestamp: number;
 }
 
+interface Trade {
+  symbol: string;
+  price: number;
+  size: number;
+  id: string;
+  tape: number; // (1 = NYSE, 2 = AMEX, 3 = Nasdaq).
+  sequence_number: number;
+  timestamp: number;
+  trtf: number; // The TRF (Trade Reporting Facility) Timestamp in Unix MS
+}
+
 export default function OrderBookDashboard() {
+  // local storage for symbols
   const [symbols, setSymbols] = useState<string[]>(() => {
     const saved = localStorage.getItem("symbols");
     return saved ? JSON.parse(saved) : [];
@@ -20,7 +32,7 @@ export default function OrderBookDashboard() {
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
 
   useEffect(() => {
-    ws.current = new WebSocket("ws://localhost:8000/ws/quotes");
+    ws.current = new WebSocket("ws://localhost:8000/ws/tickdata");
 
     ws.current.onopen = () => {
       console.log("✅ Connected to backend");

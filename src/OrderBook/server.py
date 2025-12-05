@@ -6,11 +6,16 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .polygon_manager import PolygonWebSocketManager
+from ..DataSupply.polygon_manager import PolygonWebSocketManager
+from ..DataSupply.simulator_manager import LocalReplayWebSocketManager
+from ..utils.logger import setup_logger
+
+logger = setup_logger(__name__, log_to_file=True)
 
 load_dotenv()
 app = FastAPI()
 manager = PolygonWebSocketManager(api_key=os.getenv("POLYGON_API_KEY"))
+# manager = LocalReplayWebSocketManager("20251112")
 
 
 @app.on_event("startup")
@@ -218,7 +223,7 @@ async def debug_page():
 
 
 # websocket
-@app.websocket("/ws/quotes")
+@app.websocket("/ws/tickdata")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     consumer_tasks = {}  # store each symbol consume task {symbol: task}
@@ -235,7 +240,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     consumer_tasks[symbol].cancel()
                     del consumer_tasks[symbol]
                 current_symbols.discard(symbol)
-                print(f"Debug: Unsubscribed from {symbol}")
             else:
                 try:
                     data = json.loads(msg)
@@ -250,14 +254,13 @@ async def websocket_endpoint(websocket: WebSocket):
                             task = asyncio.create_task(consume_symbol(websocket, sym))
                             consumer_tasks[sym] = task
                         current_symbols.update(new_symbols)
-                        print(f"Debug: Subscribed to {new_symbols}")
 
                 except json.JSONDecodeError as e:
                     print(f"⚠️ JSON decode error: {e}")
 
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
-        for task in consumer_tasks:
+        for task in consumer_tasks.values():
             task.cancel()
 
 
