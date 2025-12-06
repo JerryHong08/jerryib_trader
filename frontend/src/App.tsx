@@ -50,7 +50,7 @@ export default function OrderBookDashboard() {
 
     ws.current.onmessage = (event) => {
       // messages include an event_type field now
-      // console.log("📩 Message from server:", event.data);
+      console.log("📩 Message from server:", event.data);
       const data = JSON.parse(event.data);
       const ev = data.event_type;
       const sym = data.symbol;

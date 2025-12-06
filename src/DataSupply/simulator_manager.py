@@ -49,11 +49,13 @@ class LocalReplayWebSocketManager:
             self._parse_start_time(replay_date, start_time) if start_time else None
         )
 
-        # Connection management
-        self.connections: Dict[str, Dict] = {}
-        self.queues: Dict[str, asyncio.Queue] = {}
-        self.tasks: Dict[str, asyncio.Task] = {}
-        self.subscribed_symbols = set()
+        # Connection management (unified with Polygon/ThetaData interface)
+        self.connections: Dict[object, set] = {}  # {websocket_client: set(stream_keys)}
+        self.queues: Dict[str, asyncio.Queue] = {}  # {stream_key: Queue}
+        self.tasks: Dict[str, asyncio.Task] = {}  # {symbol: replay_task}
+        self.subscribed_streams: set = set()  # set of stream_keys
+        self.subscribed_symbols: set = set()  # set of symbols with active replay tasks
+        self.connected = True  # For compatibility
 
         # Data source
         self.lake_data_dir = Path(lake_data_dir)
@@ -176,7 +178,10 @@ class LocalReplayWebSocketManager:
                         "z": int(row.get("tape") or 0),
                     }
 
-                    q = self.queues.get(symbol)
+                    # Send to all stream_keys for this symbol (e.g., Q.AAPL, T.AAPL)
+                    # For now, simulator only supports Quote data, so we use "Q" event
+                    stream_key = f"Q.{symbol}"
+                    q = self.queues.get(stream_key)
                     if q:
                         await q.put(payload)
                         self.stats["total_messages"] += 1
@@ -308,10 +313,8 @@ class LocalReplayWebSocketManager:
                         await flush_until(target_ts)
                         await asyncio.sleep(self.metronome_sleep)
 
-            # Done for symbol
-            q = self.queues.get(symbol)
-            if q:
-                await q.put(None)
+            # Done for symbol - no completion signal needed for unified interface
+            # Queues remain open for potential reconnection
 
             # Optionally compute drift stats (we can track samples during run; omitted here for brevity)
 
@@ -330,99 +333,106 @@ class LocalReplayWebSocketManager:
                 await q.put(None)
             raise
 
-    async def subscribe(self, client_id: str, symbols: list[str], callback: Callable):
-        self.connections[client_id] = {"symbols": symbols, "callback": callback}
+    async def subscribe(self, websocket_client, symbols: list[str], events=["Q"]):
+        """Subscribe to symbols (unified interface like Polygon/ThetaData)."""
+        if websocket_client not in self.connections:
+            self.connections[websocket_client] = set()
 
         for symbol in symbols:
-            if symbol not in self.subscribed_symbols:
-                self.queues[symbol] = asyncio.Queue()
-                self.stats["queue_full_count"][symbol] = 0
+            for ev in events:
+                stream_key = f"{ev}.{symbol}"
 
-                task = asyncio.create_task(self._replay_symbol_task(symbol))
-                self.tasks[symbol] = task
+                # Create queue for this stream_key
+                if stream_key not in self.queues:
+                    self.queues[stream_key] = asyncio.Queue()
+                    self.stats["queue_full_count"][stream_key] = 0
 
-                consumer_task = asyncio.create_task(
-                    self._consume_queue(symbol, client_id)
-                )
-                self.tasks[f"{symbol}_consumer"] = consumer_task
+                # Add to client subscriptions
+                self.connections[websocket_client].add(stream_key)
+                self.subscribed_streams.add(stream_key)
 
-                self.subscribed_symbols.add(symbol)
-                logger.info(f"馃摗 {client_id} subscribed to {symbol}")
-            else:
-                logger.info(
-                    f"馃摗 {client_id} joined existing subscription for {symbol}"
-                )
+                # Start replay task (once per symbol)
+                if symbol not in self.subscribed_symbols:
+                    task = asyncio.create_task(self._replay_symbol_task(symbol))
+                    self.tasks[symbol] = task
+                    self.subscribed_symbols.add(symbol)
+                    logger.info(f"Started replay for {symbol}")
 
-    async def _consume_queue(self, symbol: str, client_id: str):
-        queue = self.queues[symbol]
-        message_count = 0
+                logger.info(f"Subscribed to {stream_key}")
 
-        while True:
-            try:
-                payload = await queue.get()
-
-                if payload is None:
-                    logger.info(
-                        f"馃弫 {symbol} consumer received completion signal (processed {message_count} messages)"
-                    )
-                    queue.task_done()
-                    break
-
-                client_info = self.connections.get(client_id)
-                if client_info:
-                    callback = client_info["callback"]
-                    await callback(symbol, payload)
-
-                message_count += 1
-                queue.task_done()
-
-            except asyncio.CancelledError:
-                logger.info(f"馃洃 Consumer stopped for {symbol}")
-                break
-            except Exception:
-                logger.exception(f"鉂?Error consuming {symbol}")
-
-        logger.info(
-            f"鉁?Consumer completed for {symbol} (total: {message_count} messages)"
-        )
-
-    async def unsubscribe(self, client_id: str, symbols: Optional[list[str]] = None):
-        if client_id not in self.connections:
-            logger.warning(f"Client {client_id} not found")
+    async def unsubscribe(self, websocket_client, symbol: str, events=["Q"]):
+        """Unsubscribe from symbol (unified interface)."""
+        if websocket_client not in self.connections:
             return
 
-        if symbols is None:
-            symbols = self.connections[client_id]["symbols"]
+        for ev in events:
+            stream_key = f"{ev}.{symbol}"
+            self.connections[websocket_client].discard(stream_key)
+
+            # Check if still needed by other clients
+            still_needed = any(
+                stream_key in streams for streams in self.connections.values()
+            )
+
+            if not still_needed:
+                # Cancel replay task
+                if symbol in self.tasks:
+                    self.tasks[symbol].cancel()
+                    del self.tasks[symbol]
+
+                if symbol in self.subscribed_symbols:
+                    self.subscribed_symbols.remove(symbol)
+
+                self.subscribed_streams.discard(stream_key)
+                self.queues.pop(stream_key, None)
+                logger.info(f"Unsubscribed from {stream_key}")
+
+    async def disconnect(self, websocket_client):
+        """Clean up when client disconnects (unified interface)."""
+        client_streams = self.connections.pop(websocket_client, set())
+
+        # Extract unique symbols
+        symbols = set(sk.split(".")[1] for sk in client_streams if "." in sk)
 
         for symbol in symbols:
-            if symbol in self.tasks:
-                self.tasks[symbol].cancel()
-                del self.tasks[symbol]
-            consumer_key = f"{symbol}_consumer"
-            if consumer_key in self.tasks:
-                self.tasks[consumer_key].cancel()
-                del self.tasks[consumer_key]
-            if symbol in self.subscribed_symbols:
-                self.subscribed_symbols.remove(symbol)
-            logger.info(f"馃攲 {client_id} unsubscribed from {symbol}")
+            # Check if any stream for this symbol is still needed
+            still_needed = any(
+                any(sk.endswith(f".{symbol}") for sk in streams)
+                for streams in self.connections.values()
+            )
 
-        # remove client record
-        if client_id in self.connections:
-            del self.connections[client_id]
+            if not still_needed:
+                if symbol in self.tasks:
+                    self.tasks[symbol].cancel()
+                    del self.tasks[symbol]
+
+                if symbol in self.subscribed_symbols:
+                    self.subscribed_symbols.remove(symbol)
+
+                # Remove all stream_keys for this symbol
+                for sk in list(self.subscribed_streams):
+                    if sk.endswith(f".{symbol}"):
+                        self.subscribed_streams.discard(sk)
+                        self.queues.pop(sk, None)
+
+                logger.info(f"Auto-unsubscribed: {symbol}")
+
+    async def stream_forever(self):
+        """No-op for simulator (replay tasks started per symbol in subscribe)."""
+        pass
 
     async def wait_for_completion(self):
         if self.tasks:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-        logger.info("鉁?All replay tasks completed")
+        logger.info("All replay tasks completed")
 
     def get_stats(self) -> Dict:
         return {
             **self.stats,
             "active_symbols": len(self.subscribed_symbols),
-            "active_clients": len(self.connections),
-            "queue_sizes": {
-                symbol: self.queues[symbol].qsize() for symbol in self.queues
-            },
+            "active_connections": len(self.connections),
+            "active_streams": len(self.subscribed_streams),
+            "queue_sizes": {sk: self.queues[sk].qsize() for sk in self.queues},
         }
 
 

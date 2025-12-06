@@ -4,3 +4,7 @@ __pycache__/
 *.sqlite3
 data/*
 !data/.gitkeep
+.vscode
+
+logs/
+dos/

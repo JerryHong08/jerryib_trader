@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..DataSupply.polygon_manager import PolygonWebSocketManager
 from ..DataSupply.simulator_manager import LocalReplayWebSocketManager
+from ..DataSupply.thetadata_manager import ThetaDataManager
 from ..utils.logger import setup_logger
 
 logger = setup_logger(__name__, log_to_file=True)
@@ -15,13 +16,176 @@ logger = setup_logger(__name__, log_to_file=True)
 load_dotenv()
 app = FastAPI()
 
-manager = PolygonWebSocketManager(api_key=os.getenv("POLYGON_API_KEY"))
-# manager = LocalReplayWebSocketManager("20251112")
+
+# ============================================================================
+# Unified Subscription Adapter
+# ============================================================================
+class SubscriptionAdapter:
+    """
+    Adapter to translate unified subscription format to manager-specific format.
+
+    Unified Format (from frontend):
+    {
+        "provider": "polygon" | "theta" | "simulator" (optional, uses MANAGER_TYPE if not provided),
+        "subscriptions": [
+            {
+                "symbol": "AAPL",
+                "events": ["QUOTE", "TRADE"],
+                "sec_type": "STOCK" (optional, for ThetaData),
+                "contract": {} (optional, for options)
+            }
+        ]
+    }
+    """
+
+    @staticmethod
+    def to_polygon(subscriptions: list) -> tuple:
+        """
+        Convert to Polygon format.
+        Returns: (symbols, events)
+        """
+        symbols = []
+        events = set()
+
+        for sub in subscriptions:
+            symbol = sub.get("symbol", "").upper()
+            sub_events = sub.get("events", ["QUOTE"])
+
+            if symbol:
+                symbols.append(symbol)
+
+            # Map unified event names to Polygon codes
+            for ev in sub_events:
+                ev = ev.upper()
+                if ev in ("QUOTE", "Q"):
+                    events.add("Q")
+                elif ev in ("TRADE", "T"):
+                    events.add("T")
+
+        return symbols, list(events)
+
+    @staticmethod
+    def to_theta(subscriptions: list) -> list:
+        """
+        Convert to ThetaData format.
+        Returns: List of subscription dicts
+        """
+        theta_subs = []
+
+        for sub in subscriptions:
+            symbol = sub.get("symbol", "").upper()
+            events = sub.get("events", ["QUOTE"])
+            sec_type = sub.get("sec_type", "STOCK").upper()
+            contract = sub.get("contract", {})
+
+            # Build contract dict
+            if not contract:
+                contract = {"root": symbol}
+            elif "root" not in contract:
+                contract["root"] = symbol
+
+            # Map unified event names to ThetaData codes
+            req_types = []
+            for ev in events:
+                ev = ev.upper()
+                if ev in ("QUOTE", "Q"):
+                    req_types.append("QUOTE")
+                elif ev in ("TRADE", "T"):
+                    req_types.append("TRADE")
+
+            theta_subs.append(
+                {"sec_type": sec_type, "req_types": req_types, "contract": contract}
+            )
+
+        return theta_subs
+
+    @staticmethod
+    def to_simulator(subscriptions: list) -> list:
+        """
+        Convert to Simulator format.
+        Returns: List of symbols
+        """
+        symbols = []
+        for sub in subscriptions:
+            symbol = sub.get("symbol", "").upper()
+            if symbol:
+                symbols.append(symbol)
+        return symbols
+
+    @staticmethod
+    def generate_stream_keys(subscriptions: list, manager_type: str) -> set:
+        """
+        Generate stream keys for tracking based on manager type.
+        """
+        stream_keys = set()
+
+        for sub in subscriptions:
+            symbol = sub.get("symbol", "").upper()
+            events = sub.get("events", ["QUOTE"])
+            sec_type = sub.get("sec_type", "STOCK").upper()
+            contract = sub.get("contract", {})
+
+            for ev in events:
+                ev = ev.upper()
+                # Normalize event name
+                if ev == "QUOTE":
+                    ev = "Q"
+                elif ev == "TRADE":
+                    ev = "T"
+
+                if manager_type == "polygon":
+                    stream_keys.add(f"{ev}.{symbol}")
+
+                elif manager_type == "theta":
+                    # Generate ThetaData stream key
+                    if sec_type in ("STOCK", "INDEX"):
+                        identifier = symbol
+                    elif sec_type == "OPTION":
+                        root = contract.get("root", symbol)
+                        exp = contract.get("expiration", "")
+                        strike = contract.get("strike", "")
+                        right = contract.get("right", "")
+                        identifier = f"{root}_{exp}_{strike}_{right}"
+                    else:
+                        identifier = symbol
+
+                    # Map to ThetaData event names
+                    theta_ev = "QUOTE" if ev == "Q" else "TRADE"
+                    stream_keys.add(f"{sec_type}.{theta_ev}.{identifier}")
+
+                elif manager_type == "simulator":
+                    # Simulator uses simple symbol keys
+                    stream_keys.add(f"{ev}.{symbol}")
+
+        return stream_keys
+
+
+adapter = SubscriptionAdapter()
+
+
+# ============================================================================
+# Manager Configuration - Choose ONE
+# ============================================================================
+MANAGER_TYPE = os.getenv("DATA_MANAGER", "polygon")  # polygon, theta, simulator
+
+if MANAGER_TYPE == "polygon":
+    manager = PolygonWebSocketManager(api_key=os.getenv("POLYGON_API_KEY"))
+elif MANAGER_TYPE == "theta":
+    manager = ThetaDataManager()
+elif MANAGER_TYPE == "simulator":
+    replay_date = os.getenv("REPLAY_DATE", "20251112")
+    start_time = os.getenv("REPLAY_START_TIME", None)  # Format: "09:30" or "09:30:00"
+    manager = LocalReplayWebSocketManager(replay_date, start_time=start_time)
+else:
+    raise ValueError(f"Unknown MANAGER_TYPE: {MANAGER_TYPE}")
+
+logger.info(f"🚀 Using {MANAGER_TYPE.upper()} data manager")
 
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(manager.stream_forever())
+    if MANAGER_TYPE != "simulator":
+        asyncio.create_task(manager.stream_forever())
 
 
 # debug
@@ -230,113 +394,228 @@ async def debug_page():
 @app.websocket("/ws/tickdata")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    consumer_tasks = {}  # store each symbol consume task {symbol: task}
-    # now track stream_keys (e.g. Q.AAPL, T.AAPL)
     consumer_tasks = {}
     current_streams = set()
 
     try:
         while True:
             msg = await websocket.receive_text()
+            try:
+                data = json.loads(msg)
 
-            # support legacy string unsubscribe:unsubscribe:SYMBOL or unsubscribe:Q.SYMBOL
-            if isinstance(msg, str) and msg.startswith("unsubscribe:"):
-                val = msg.replace("unsubscribe:", "").strip().upper()
-                # if stream_key format provided (ev.SYMBOL)
-                if "." in val:
-                    stream_key = val
-                    logger.debug(f"unsubscribe: {stream_key}")
-                    ev, sym = stream_key.split(".", 1)
-                    await manager.unsubscribe(websocket, sym, events=[ev])
-                    if stream_key in current_streams:
-                        consumer_tasks[stream_key].cancel()
-                        del consumer_tasks[stream_key]
-                    current_streams.discard(stream_key)
-                else:
-                    # unsubscribe all events for this symbol
-                    # best-effort: try Q and T
-                    await manager.unsubscribe(websocket, val, events=["Q", "T"])
-                    # cancel any tasks matching that symbol
-                    for sk in list(current_streams):
-                        if sk.endswith(f".{val}"):
-                            consumer_tasks[sk].cancel()
-                            del consumer_tasks[sk]
-                            current_streams.discard(sk)
+                # ============================================================================
+                # UNSUBSCRIBE HANDLING (Unified)
+                # ============================================================================
+                if data.get("action") == "unsubscribe":
+                    subscriptions = data.get("subscriptions", [])
 
-            else:
-                try:
-                    data = json.loads(msg)
+                    # Backward compatibility: single symbol unsubscribe
+                    if not subscriptions and "symbol" in data:
+                        subscriptions = [
+                            {
+                                "symbol": data.get("symbol"),
+                                "events": data.get("events", ["Q"]),
+                                "sec_type": data.get("sec_type", "STOCK"),
+                                "contract": data.get("contract", {}),
+                            }
+                        ]
 
-                    # handle unsubscribe action from JSON message
-                    if data.get("action") == "unsubscribe":
-                        sym = data.get("symbol", "").strip().upper()
-                        evs = data.get("events", ["Q"])
-                        evs = [e.strip().upper() for e in evs]
+                    logger.info(f"📤 Unsubscribe request: {subscriptions}")
 
-                        logger.info(f"📤 Unsubscribe request: {sym} events={evs}")
-                        await manager.unsubscribe(websocket, sym, events=evs)
+                    # Unsubscribe from manager
+                    if MANAGER_TYPE == "polygon":
+                        for sub in subscriptions:
+                            sym = sub.get("symbol", "").upper()
+                            evs = sub.get("events", ["Q"])
+                            evs = [
+                                (
+                                    e.upper()
+                                    if e.upper() in ("Q", "T")
+                                    else ("Q" if e.upper() == "QUOTE" else "T")
+                                )
+                                for e in evs
+                            ]
+                            await manager.unsubscribe(websocket, sym, events=evs)
 
-                        # cancel consumer tasks for these stream_keys
-                        for ev in evs:
-                            stream_key = f"{ev}.{sym}"
-                            if stream_key in current_streams:
-                                consumer_tasks[stream_key].cancel()
-                                del consumer_tasks[stream_key]
-                                current_streams.discard(stream_key)
-                        continue
+                    elif MANAGER_TYPE == "theta":
+                        for sub in subscriptions:
+                            sec_type = sub.get("sec_type", "STOCK").upper()
+                            evs = sub.get("events", ["QUOTE"])
+                            req_types = [
+                                "QUOTE" if e.upper() in ("Q", "QUOTE") else "TRADE"
+                                for e in evs
+                            ]
+                            contract = sub.get(
+                                "contract", {"root": sub.get("symbol", "").upper()}
+                            )
+                            if "root" not in contract:
+                                contract["root"] = sub.get("symbol", "").upper()
+                            await manager.unsubscribe(
+                                websocket, sec_type, req_types, contract
+                            )
 
-                    # new message shape: either
-                    # { "subscriptions": [{"symbol":"AAPL","events":["Q","T"]}, ...] }
-                    # or { "symbols": ["AAPL","MSFT"], "events": ["Q","T"] }
+                    elif MANAGER_TYPE == "simulator":
+                        # Simulator unsubscribe
+                        for sub in subscriptions:
+                            sym = sub.get("symbol", "").upper()
+                            evs = sub.get("events", ["Q"])
+                            evs = [
+                                (
+                                    e.upper()
+                                    if e.upper() in ("Q", "T")
+                                    else ("Q" if e.upper() == "QUOTE" else "T")
+                                )
+                                for e in evs
+                            ]
+                            await manager.unsubscribe(websocket, sym, events=evs)
 
-                    new_streams = set()
+                    # Cancel consumer tasks for unsubscribed streams
+                    unsubscribed_keys = adapter.generate_stream_keys(
+                        subscriptions, MANAGER_TYPE
+                    )
+                    for stream_key in unsubscribed_keys:
+                        if stream_key in current_streams:
+                            consumer_tasks[stream_key].cancel()
+                            del consumer_tasks[stream_key]
+                            current_streams.discard(stream_key)
 
-                    if "subscriptions" in data:
-                        for entry in data["subscriptions"]:
-                            sym = entry.get("symbol", "").strip().upper()
-                            evs = entry.get("events", ["Q"])
-                            evs = [e.strip().upper() for e in evs]
-                            # subscribe per symbol+events
-                            await manager.subscribe(websocket, [sym], events=evs)
-                            for ev in evs:
-                                new_streams.add(f"{ev}.{sym}")
+                    continue
 
-                    else:
-                        symbols = data.get("symbols", [])
-                        events = data.get("events", ["Q"])
-                        if isinstance(symbols, str):
-                            symbols = [s.strip().upper() for s in symbols.split(",")]
-                        symbols = [s.strip().upper() for s in symbols]
-                        events = [e.strip().upper() for e in events]
+                # ============================================================================
+                # SUBSCRIBE HANDLING (Unified)
+                # ============================================================================
+                subscriptions = data.get("subscriptions", [])
 
-                        if symbols:
-                            await manager.subscribe(websocket, symbols, events=events)
-                            for sym in symbols:
-                                for ev in events:
-                                    new_streams.add(f"{ev}.{sym}")
+                # Backward compatibility: legacy polygon format
+                if not subscriptions:
+                    symbols = data.get("symbols", [])
+                    events = data.get("events", ["Q"])
+                    if isinstance(symbols, str):
+                        symbols = [s.strip() for s in symbols.split(",")]
 
-                    # create consumer tasks for new_streams not already present
-                    to_add = new_streams - current_streams
-                    for sk in to_add:
-                        task = asyncio.create_task(consume_stream(websocket, sk))
-                        consumer_tasks[sk] = task
-                    current_streams.update(to_add)
+                    subscriptions = [
+                        {"symbol": sym, "events": events, "sec_type": "STOCK"}
+                        for sym in symbols
+                        if sym
+                    ]
 
-                except json.JSONDecodeError as e:
-                    print(f"⚠️ JSON decode error: {e}")
+                if not subscriptions:
+                    logger.warning("⚠️ No subscriptions found in message")
+                    continue
+
+                logger.info(f"📥 Subscribe request: {subscriptions}")
+
+                # Subscribe to manager
+                if MANAGER_TYPE == "polygon":
+                    symbols, events = adapter.to_polygon(subscriptions)
+                    if symbols:
+                        await manager.subscribe(websocket, symbols, events=events)
+
+                elif MANAGER_TYPE == "theta":
+                    theta_subs = adapter.to_theta(subscriptions)
+                    await manager.subscribe(websocket, theta_subs)
+
+                elif MANAGER_TYPE == "simulator":
+                    symbols = adapter.to_simulator(subscriptions)
+                    if symbols:
+                        # Simulator subscribe needs a callback
+                        async def callback(symbol: str, payload: dict):
+                            q = manager.queues.get(symbol)
+                            if q:
+                                await q.put(payload)
+
+                        await manager.subscribe(websocket, symbols, callback)
+
+                # Generate stream keys and create consumer tasks
+                new_streams = adapter.generate_stream_keys(subscriptions, MANAGER_TYPE)
+                to_add = new_streams - current_streams
+
+                for sk in to_add:
+                    task = asyncio.create_task(consume_stream(websocket, sk))
+                    consumer_tasks[sk] = task
+                    logger.debug(f"📡 Created consumer task for {sk}")
+
+                current_streams.update(to_add)
+
+            except json.JSONDecodeError as e:
+                logger.error(f"⚠️ JSON decode error: {e}")
 
     except WebSocketDisconnect:
+        logger.info("🔌 WebSocket disconnected")
         await manager.disconnect(websocket)
         for task in consumer_tasks.values():
             task.cancel()
 
 
 async def consume_stream(websocket: WebSocket, stream_key: str):
-    """consume a specific stream_key queue and push to frontend"""
+    """Consume a specific stream_key queue and push to frontend"""
     q = manager.queues.get(stream_key)
     if q is None:
-        # nothing to consume
+        logger.warning(f"⚠️ No queue found for stream_key: {stream_key}")
         return
-    while True:
-        data = await q.get()
-        await websocket.send_json(data)
+
+    logger.debug(f"🎧 Consumer started for {stream_key}")
+
+    try:
+        while True:
+            data = await q.get()
+
+            # Normalize data format for frontend (convert ThetaData/Simulator to Polygon format)
+            normalized_data = normalize_data_for_frontend(data, MANAGER_TYPE)
+
+            await websocket.send_json(normalized_data)
+    except asyncio.CancelledError:
+        logger.debug(f"🛑 Consumer cancelled for {stream_key}")
+    except Exception as e:
+        logger.error(f"❌ Error in consumer for {stream_key}: {e}")
+
+
+def normalize_data_for_frontend(data: dict, manager_type: str) -> dict:
+    """
+    Normalize data from different managers to a unified frontend format (Polygon-like).
+
+    Frontend expects:
+    - Quote: { event_type: "Q", symbol, bid, ask, bid_size, ask_size, timestamp }
+    - Trade: { event_type: "T", symbol, price, size, timestamp }
+    """
+    event_type = data.get("event_type", "").upper()
+
+    # Polygon format is already correct
+    if manager_type == "polygon":
+        return data
+
+    # Convert ThetaData format
+    if manager_type == "theta":
+        symbol = data.get("symbol", "")
+        timestamp = data.get("timestamp")
+
+        if event_type == "QUOTE":
+            return {
+                "event_type": "Q",
+                "symbol": symbol,
+                "bid": data.get("bid"),
+                "ask": data.get("ask"),
+                "bid_size": data.get("bid_size"),
+                "ask_size": data.get("ask_size"),
+                "timestamp": timestamp,
+            }
+        elif event_type == "TRADE":
+            return {
+                "event_type": "T",
+                "symbol": symbol,
+                "price": data.get("price"),
+                "size": data.get("size"),
+                "timestamp": timestamp,
+            }
+
+    # Convert Simulator format (should already be similar to Polygon)
+    if manager_type == "simulator":
+        # Simulator uses "Q" and "T" already, but double-check
+        if event_type in ("QUOTE", "Q"):
+            data["event_type"] = "Q"
+        elif event_type in ("TRADE", "T"):
+            data["event_type"] = "T"
+        return data
+
+    # Fallback: return as-is
+    return data
