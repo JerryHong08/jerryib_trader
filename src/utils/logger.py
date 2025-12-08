@@ -8,7 +8,7 @@ LOG_DIR = PROJECT_ROOT / "logs" / "jerryib_trader"
 
 
 def setup_logger(
-    name: str, log_dir: str = None, level=logging.INFO, log_to_file: bool = True
+    name: str, log_dir: str = None, level=logging.DEBUG, log_to_file: bool = True
 ) -> logging.Logger:
     """
     Setup a logger with file and console handlers

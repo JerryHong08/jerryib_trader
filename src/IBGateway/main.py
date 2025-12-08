@@ -2,7 +2,7 @@
 
 import logging
 
-from src.IBGateway.ib_gateway import IBGateway
+from IBGateway.ib_gateway_test import IBGateway
 
 logging.basicConfig(level=logging.INFO)
 

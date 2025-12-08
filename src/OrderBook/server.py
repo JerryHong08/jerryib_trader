@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..DataSupply.polygon_manager import PolygonWebSocketManager
-from ..DataSupply.simulator_manager import LocalReplayWebSocketManager
+from ..DataSupply.replayer_manager import ReplayerWebSocketManager
 from ..DataSupply.thetadata_manager import ThetaDataManager
 from ..utils.logger import setup_logger
 
@@ -26,7 +26,7 @@ class SubscriptionAdapter:
 
     Unified Format (from frontend):
     {
-        "provider": "polygon" | "theta" | "simulator" (optional, uses MANAGER_TYPE if not provided),
+        "provider": "polygon" | "theta" | "replayer" (optional, uses MANAGER_TYPE if not provided),
         "subscriptions": [
             {
                 "symbol": "AAPL",
@@ -100,17 +100,29 @@ class SubscriptionAdapter:
         return theta_subs
 
     @staticmethod
-    def to_simulator(subscriptions: list) -> list:
+    def to_replayer(subscriptions: list) -> tuple:
         """
-        Convert to Simulator format.
-        Returns: List of symbols
+        Convert to Replayer format (same as Polygon).
+        Returns: (symbols, events)
         """
         symbols = []
+        events = set()
+
         for sub in subscriptions:
             symbol = sub.get("symbol", "").upper()
+            sub_events = sub.get("events", ["Q"])
+
             if symbol:
                 symbols.append(symbol)
-        return symbols
+
+            for ev in sub_events:
+                ev = ev.upper()
+                if ev in ("QUOTE", "Q"):
+                    events.add("Q")
+                elif ev in ("TRADE", "T"):
+                    events.add("T")
+
+        return symbols, list(events)
 
     @staticmethod
     def generate_stream_keys(subscriptions: list, manager_type: str) -> set:
@@ -153,8 +165,8 @@ class SubscriptionAdapter:
                     theta_ev = "QUOTE" if ev == "Q" else "TRADE"
                     stream_keys.add(f"{sec_type}.{theta_ev}.{identifier}")
 
-                elif manager_type == "simulator":
-                    # Simulator uses simple symbol keys
+                elif manager_type == "replayer":
+                    # Replayer uses same format as Polygon
                     stream_keys.add(f"{ev}.{symbol}")
 
         return stream_keys
@@ -166,16 +178,16 @@ adapter = SubscriptionAdapter()
 # ============================================================================
 # Manager Configuration - Choose ONE
 # ============================================================================
-MANAGER_TYPE = os.getenv("DATA_MANAGER", "polygon")  # polygon, theta, simulator
+MANAGER_TYPE = os.getenv("DATA_MANAGER", "polygon")  # polygon, theta, replayer
 
 if MANAGER_TYPE == "polygon":
     manager = PolygonWebSocketManager(api_key=os.getenv("POLYGON_API_KEY"))
 elif MANAGER_TYPE == "theta":
     manager = ThetaDataManager()
-elif MANAGER_TYPE == "simulator":
-    replay_date = os.getenv("REPLAY_DATE", "20251112")
-    start_time = os.getenv("REPLAY_START_TIME", None)  # Format: "09:30" or "09:30:00"
-    manager = LocalReplayWebSocketManager(replay_date, start_time=start_time)
+elif MANAGER_TYPE == "replayer":
+    # Replayer connects to local Rust WebSocket server
+    replay_url = os.getenv("REPLAY_URL", "ws://127.0.0.1:8765")
+    manager = ReplayerWebSocketManager(replay_url=replay_url)
 else:
     raise ValueError(f"Unknown MANAGER_TYPE: {MANAGER_TYPE}")
 
@@ -184,8 +196,8 @@ logger.info(f"🚀 Using {MANAGER_TYPE.upper()} data manager")
 
 @app.on_event("startup")
 async def startup_event():
-    if MANAGER_TYPE != "simulator":
-        asyncio.create_task(manager.stream_forever())
+    # Start streaming task for all managers (replayer also needs stream_forever)
+    asyncio.create_task(manager.stream_forever())
 
 
 # debug
@@ -454,8 +466,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                 websocket, sec_type, req_types, contract
                             )
 
-                    elif MANAGER_TYPE == "simulator":
-                        # Simulator unsubscribe
+                    elif MANAGER_TYPE == "replayer":
+                        # Replayer unsubscribe (same interface as Polygon)
                         for sub in subscriptions:
                             sym = sub.get("symbol", "").upper()
                             evs = sub.get("events", ["Q"])
@@ -515,16 +527,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     theta_subs = adapter.to_theta(subscriptions)
                     await manager.subscribe(websocket, theta_subs)
 
-                elif MANAGER_TYPE == "simulator":
-                    symbols = adapter.to_simulator(subscriptions)
+                elif MANAGER_TYPE == "replayer":
+                    symbols, events = adapter.to_replayer(subscriptions)
                     if symbols:
-                        # Simulator subscribe needs a callback
-                        async def callback(symbol: str, payload: dict):
-                            q = manager.queues.get(symbol)
-                            if q:
-                                await q.put(payload)
-
-                        await manager.subscribe(websocket, symbols, callback)
+                        await manager.subscribe(websocket, symbols, events=events)
 
                 # Generate stream keys and create consumer tasks
                 new_streams = adapter.generate_stream_keys(subscriptions, MANAGER_TYPE)
@@ -577,12 +583,39 @@ def normalize_data_for_frontend(data: dict, manager_type: str) -> dict:
     Frontend expects:
     - Quote: { event_type: "Q", symbol, bid, ask, bid_size, ask_size, timestamp }
     - Trade: { event_type: "T", symbol, price, size, timestamp }
+
+    All timestamps must be in milliseconds (13 digits).
     """
+
+    def to_milliseconds(ts):
+        """Convert any timestamp format to milliseconds."""
+        if ts is None:
+            return None
+        # Nanoseconds (19 digits) - from Rust replayer
+        if ts > 1e15:
+            return int(ts // 1e6)
+        # Already milliseconds (13 digits)
+        elif ts > 1e12:
+            return int(ts)
+        # Seconds (10 digits)
+        else:
+            return int(ts * 1000)
+
     event_type = data.get("event_type", "").upper()
 
-    # Polygon format is already correct
+    # Polygon format - just normalize timestamp
     if manager_type == "polygon":
-        return data
+        normalized = data.copy()
+        if "timestamp" in normalized:
+            normalized["timestamp"] = to_milliseconds(normalized["timestamp"])
+        return normalized
+
+    # Replayer format (from Rust server) - same as Polygon but with nanosecond timestamps
+    if manager_type == "replayer":
+        normalized = data.copy()
+        if "timestamp" in normalized:
+            normalized["timestamp"] = to_milliseconds(normalized["timestamp"])
+        return normalized
 
     # Convert ThetaData format
     if manager_type == "theta":
@@ -607,15 +640,6 @@ def normalize_data_for_frontend(data: dict, manager_type: str) -> dict:
                 "size": data.get("size"),
                 "timestamp": timestamp,
             }
-
-    # Convert Simulator format (should already be similar to Polygon)
-    if manager_type == "simulator":
-        # Simulator uses "Q" and "T" already, but double-check
-        if event_type in ("QUOTE", "Q"):
-            data["event_type"] = "Q"
-        elif event_type in ("TRADE", "T"):
-            data["event_type"] = "T"
-        return data
 
     # Fallback: return as-is
     return data
