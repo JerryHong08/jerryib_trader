@@ -10,6 +10,21 @@ windows_host = os.getenv("WINDOWS_HOST")
 
 print(f"debug: {windows_host}")
 
+ib_config = {
+    "Windows_TWS"[
+        "host":windows_host,
+        "port":7497,  # 7497 for paper, 7496 for live
+        "client_id":"jerry_trade",
+        "timeout":20,
+    ],
+    "Ubuntu_IBGateway"[
+        "host":"localhost",
+        "port":4002,  # 4001 for paper, 4002 for live
+        "client_id":"jerry_trade",
+        "timeout":20,
+    ],
+}
+
 
 class IBGateway:
     # for windows TWS

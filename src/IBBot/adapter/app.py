@@ -4,10 +4,14 @@ import threading
 import time
 
 import empyrical as ep
-from client import IBClient
-from contract import combo_leg, future, option, spread, stock
-from order import BUY, SELL, limit, market
-from wrapper import IBWrapper
+
+from IBBot.adapter.ibkr_client import IBClient
+from IBBot.adapter.ibkr_wrapper import IBWrapper
+from IBBot.models.contract import stock
+from IBBot.models.order import BUY, SELL, limit, market
+from utils.logger import setup_logger
+
+logger = setup_logger(__name__, log_to_file=True)
 
 windows_host = os.getenv("WINDOWS_HOST")
 
@@ -17,8 +21,10 @@ class IBApp(IBWrapper, IBClient):
         IBWrapper.__init__(self)
         IBClient.__init__(self, wrapper=self)
         self.account = account
-        self.create_table()
+        # self.create_table()
+
         self.connect(ip, port, client_id)
+
         threading.Thread(target=self.run, daemon=True).start()
         time.sleep(2)
         threading.Thread(
@@ -91,69 +97,13 @@ class IBApp(IBWrapper, IBClient):
 
 
 if __name__ == "__main__":
+
     app = IBApp(windows_host, 7497, client_id=10)
-    # app = IBApp("127.0.0.1", 7497, client_id=10)
-    aapl = stock("AAPL", "SMART", "USD")
-    gbl = future("GBL", "EUREX", "202512")
-    pltr = option("PLTR", "BOX", "20251114", 20, "C")
-    limit_order = limit(BUY, 100, 190.00)
-
-    # ------- Chapter12 Deploying an options combo strategy --------
-
-    # long_call_contract = option("TSLA", "SMART", "202603", 500, "CALL")
-    # long_call = app.resolve_contract(long_call_contract)
-
-    # long_put_contract = option("TSLA", "SMART", "202603", 260, "PUT")
-    # long_put = app.resolve_contract(long_put_contract)
-
-    # leg_1 = combo_leg(long_call, 1, BUY)
-    # leg_2 = combo_leg(long_put, 1, BUY)
-    # long_strangle = spread([leg_1, leg_2])
-    # order = market(BUY, 1)
-    # app.send_order(long_strangle, order)
-
-    # ------ Chapter12 Deploying an intradat multi-asset mean reversion strategy --------
-    psx = stock("PSX", "SMART", "USD")
-    ho = future("HO", "NYMEX", "202403")
-    rb = future("RB", "NYMEX", "202403")
-    cl = future("CL", "NYMEX", "202403")
+    security = stock("AAPL", "SMART", "USD")
 
     window = 60
     thresh = 2
+    order = market(BUY, 10)
+    app.send_order(security, order)
 
-    while True:
-        data = app.get_historical_data_for_many(
-            request_id=99,
-            contracts=[psx, ho, rb, cl],
-            duration="1 W",
-            bar_size="1 min",
-        ).dropna()
-        # print(f'Debug data: {data}')
-
-        data["crack_spread"] = data.HO + 2 * data.RB - 3 * data.CL
-        data["crack_spread_rank"] = data.crack_spread.rolling(window).rank(pct=True)
-        data["refiner_rank"] = data.PSX.rolling(window).rank(pct=True)
-        data["rank_spread"] = data.refiner_rank - data.crack_spread_rank
-
-        roll = data.rank_spread.rolling(window)
-        zscore = (data.rank_spread - roll.mean()) / roll.std()
-        signal = zscore[-1]
-        holding = psx.symbol in app.positions.keys()
-
-        if signal <= -thresh and not holding:
-            order = market(BUY, 10)
-            app.send_order(psx, order)
-        elif signal >= 0 and holding:
-            app.order_target_percent(psx, market, 0)
-
-        if signal >= thresh and not holding:
-            order = market(SELL, 10)
-            app.send_order(psx, order)
-        elif signal <= 0 and holding:
-            app.order_target_percent(psx.market, 0)
-
-        time.sleep(30)
-    # app.disconnect()
-
-    # Deploying a monthly factor portfolio strategy is skipped for
-    # it's basically a Zipline backtest we have learned in Chapter 6&7
+    app.disconnect()

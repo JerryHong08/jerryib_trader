@@ -1,10 +1,12 @@
 # src/ibkr_bot/main.py
 
-import logging
 
-from IBGateway.ib_gateway_test import IBGateway
+from ..utils.logger import setup_logger
 
-logging.basicConfig(level=logging.INFO)
+logger = setup_logger(__name__, log_to_file=True)
+
+
+from IBBot.adapter.ib_gateway_test import IBGateway
 
 
 def main():
